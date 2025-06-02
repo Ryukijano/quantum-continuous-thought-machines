@@ -1,125 +1,166 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import argparse # Added for command-line arguments
 
-from .quantum_memory_cell import QuantumMemoryCell
-# We might need to import components from the original CTM implementation if we're adapting it.
-# For example: from ...models.ctm import GatedMemoryUpdate # Assuming relative import path
+# Ensure QuantumMemoryCell can be imported when running as script or module
+try:
+    from .quantum_memory_cell import QuantumMemoryCell
+except ImportError:
+    from quantum_memory_cell import QuantumMemoryCell # Fallback for direct script execution
 
 class HybridCTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_memory_slots, num_qubits_per_slot, 
-                 output_size, num_heads=4, head_size=None, forget_bias=1.0):
+    def __init__(self, input_size, hidden_size, output_size, num_memory_slots,
+                 num_qubits_per_slot, memory_depth_per_slot, 
+                 backend_mode: str, # "qr-cloud", "gpu", "cpu-qiskit"
+                 qr_token: str = None, qr_user_name: str = None, 
+                 qr_backend_name='scarlet_quantum_rings',
+                 qr_job_poll_interval=5, qr_job_timeout=300):
         super(HybridCTM, self).__init__()
+
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.num_memory_slots = num_memory_slots # k in original CTM
-        self.num_qubits_per_slot = num_qubits_per_slot
         self.output_size = output_size
-        self.num_heads = num_heads
-        self.head_size = head_size if head_size else hidden_size // num_heads
-        self.forget_bias = forget_bias
+        self.num_memory_slots = num_memory_slots
 
-        if self.hidden_size % self.num_heads != 0:
-            raise ValueError("Hidden size must be divisible by the number of heads.")
-
-        # Quantum Memory Cell integration
-        self.quantum_memory = QuantumMemoryCell(num_qubits=self.num_qubits_per_slot, 
-                                                memory_depth=self.num_memory_slots,
-                                                classical_hidden_size=self.hidden_size)
-
-        # Classical components (adapted from original CTM or standard RNN/attention mechanisms)
-        # Input processing layer
-        self.input_layer = nn.Linear(input_size + hidden_size, hidden_size) # Process current input + previous hidden state
-
-        # Attention mechanism to select which quantum memory slot to access
-        # This will produce a query vector for the quantum memory or select a slot index
-        self.query_generator = nn.Linear(hidden_size, hidden_size) # Generates query for attention
-        self.memory_slot_selector = nn.Linear(hidden_size, num_memory_slots) # To get weights for memory slots
-
-        # Gating mechanisms (e.g., for memory update, input, output)
-        # These could be similar to LSTM/GRU gates or the CTM's GatedMemoryUpdate
-        # For simplicity, let's assume a simple gate for updating hidden state
-        self.output_gate_and_transform = nn.Linear(hidden_size * 2, hidden_size + output_size) # Combines current hidden and memory output
+        # Classical components (simplified from original CTM)
+        self.input_layer = nn.Linear(input_size, hidden_size)
+        self.query_generator = nn.Linear(hidden_size, hidden_size) # Generates query for memory
         
-        # Initial hidden state (classical)
-        self.initial_hidden_state = nn.Parameter(torch.zeros(1, hidden_size), requires_grad=False)
-        # No explicit classical memory matrix here, as it's replaced by quantum_memory
+        # Quantum Memory Cell - one instance that manages multiple slots internally
+        self.quantum_memory = QuantumMemoryCell(
+            num_qubits=num_qubits_per_slot, 
+            memory_depth=num_memory_slots, # The cell sees num_memory_slots as its internal depth
+            classical_hidden_size=hidden_size, # The size of vectors it processes
+            backend_mode=backend_mode,
+            qr_token=qr_token, 
+            qr_user_name=qr_user_name,
+            qr_backend_name=qr_backend_name,
+            job_poll_interval=qr_job_poll_interval, 
+            job_timeout=qr_job_timeout
+        )
 
-        print(f"HybridCTM initialized with {num_memory_slots} quantum memory slots, each {num_qubits_per_slot} qubits.")
+        # Memory slot selection (simplified: learnable query, dot product with slot embeddings)
+        # For simplicity, we don't explicitly model slot embeddings here, but rather pass
+        # the slot index directly based on some logic (e.g., round-robin or learned).
+        # Here, we assume the slot index will be provided to the forward pass.
+        
+        # Output layer / transformation (after memory read)
+        self.output_gate_and_transform = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size), # hidden_state + memory_output
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size)
+        )
+        self.current_hidden_state = None # To store the hidden state across steps if needed
 
-    def forward(self, x_t, h_prev):
+    def forward(self, x_batch, memory_slot_indices_batch):
         """
-        Performs a single step of the Hybrid CTM.
-        x_t: current input (batch_size, input_size)
-        h_prev: previous classical hidden state (batch_size, hidden_size)
+        x_batch: (batch_size, input_size)
+        memory_slot_indices_batch: (batch_size) tensor or list of integers indicating which memory slot to use for each item in the batch.
+                                 Each index should be < self.num_memory_slots.
         """
-        batch_size = x_t.size(0)
+        batch_size = x_batch.size(0)
 
-        # 1. Combine input and previous hidden state
-        combined_input = torch.cat([x_t, h_prev], dim=1)
-        h_intermediate = torch.tanh(self.input_layer(combined_input))
+        # 1. Process input and update hidden state
+        processed_input = self.input_layer(x_batch)
+        # For a recurrent model, you'd combine processed_input with self.current_hidden_state
+        # For this example, let's assume hidden_state is directly derived from current input for simplicity.
+        current_hidden_state_batch = torch.relu(processed_input) # (batch_size, hidden_size)
+        self.current_hidden_state = current_hidden_state_batch # Store for potential recurrent use
 
-        # 2. Generate query for quantum memory and select slot(s)
-        # For simplicity, let's assume we select ONE slot based on attention weights for now.
-        # In a more complex model, we could read from multiple slots or use the query to parameterize quantum ops.
-        attention_query = self.query_generator(h_intermediate)
-        memory_slot_logits = self.memory_slot_selector(attention_query) # (batch_size, num_memory_slots)
-        memory_slot_attention = F.softmax(memory_slot_logits, dim=1)
+        # 2. Generate query from hidden state (if needed for content-based addressing)
+        # memory_query_batch = self.query_generator(current_hidden_state_batch) # (batch_size, hidden_size)
+        # For this example, we are using explicit slot_indices, so query is for the content to write.
+        # The `classical_hidden_state` passed to quantum_memory.write is effectively the content.
+
+        # 3. Write to and Read from Quantum Memory
+        # The QuantumMemoryCell now handles batching internally for write and read based on slot_indices_batch
+        # The `current_hidden_state_batch` is the information we want to encode and then retrieve.
+        memory_output_batch = self.quantum_memory.forward(
+            classical_hidden_state_batch=current_hidden_state_batch, 
+            memory_slot_indices_batch=memory_slot_indices_batch,
+            shots_for_read=1024 # Default shots, can be made configurable
+        )
+        # memory_output_batch is (batch_size, hidden_size)
+
+        # 4. Combine hidden state with memory output
+        combined_representation = torch.cat((current_hidden_state_batch, memory_output_batch), dim=1)
+
+        # 5. Generate final output
+        final_output_batch = self.output_gate_and_transform(combined_representation)
         
-        # For now, let's pick the slot with the highest attention weight (this is a simplification)
-        # A true quantum attention might involve superpositions or more complex interactions.
-        # This part will need significant refinement for a proper quantum approach.
-        selected_slot_indices = torch.argmax(memory_slot_attention, dim=1) # (batch_size)
+        return final_output_batch, current_hidden_state_batch
 
-        # 3. Interact with Quantum Memory
-        # This is highly conceptual and needs actual quantum circuit execution.
-        # We would iterate per batch item if batch_first is not handled by QuantumMemoryCell
-        # For now, let's assume a loop for clarity, though batch operations are preferred.
-        quantum_memory_outputs = []
-        for i in range(batch_size):
-            # The quantum_memory will use h_intermediate (or a part of it) to parameterize its operations
-            # The `forward` of QuantumMemoryCell is a placeholder.
-            # We pass h_intermediate[i] which acts as the classical controller signal
-            q_out = self.quantum_memory.forward(h_intermediate[i].unsqueeze(0), selected_slot_indices[i].item())
-            quantum_memory_outputs.append(q_out)
-        
-        m_t = torch.cat(quantum_memory_outputs, dim=0) # (batch_size, hidden_size) - assuming q_mem outputs match hidden_size
 
-        # 4. Combine quantum memory output with intermediate hidden state
-        combined_for_output = torch.cat([h_intermediate, m_t], dim=1)
-        
-        # 5. Gate and transform for new hidden state and final output
-        gated_output_and_hidden = self.output_gate_and_transform(combined_for_output)
-        h_next = torch.tanh(gated_output_and_hidden[:, :self.hidden_size])
-        y_t = gated_output_and_hidden[:, self.hidden_size:]
-
-        return y_t, h_next
-
-    def init_hidden(self, batch_size):
-        return self.initial_hidden_state.repeat(batch_size, 1)
-
-# Example Usage (conceptual)
 if __name__ == '__main__':
-    batch_sz = 2
+    parser = argparse.ArgumentParser(description="HybridCTM Example Runner")
+    parser.add_argument("--backend_mode", type=str, default="cpu-qiskit", 
+                        choices=["qr-cloud", "gpu", "cpu-qiskit"], 
+                        help="Backend to use for quantum operations.")
+    parser.add_argument("--num_qubits", type=int, default=2, help="Number of qubits per memory slot.")
+    parser.add_argument("--num_slots", type=int, default=3, help="Number of memory slots.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size for the example run.")
+    parser.add_argument("--shots", type=int, default=100, help="Number of shots for quantum memory read.")
+    # Add QR specific args only if needed, QuantumMemoryCell has defaults or can take them
+    args = parser.parse_args()
+
+    print(f"\nRunning HybridCTM example with backend: {args.backend_mode}")
+
+    # Define model parameters
     input_dim = 10
-    hidden_dim = 32
-    mem_slots = 4 
-    qubits_per_slot = 2
+    hidden_dim = 20 
     output_dim = 5
+    num_mem_slots = args.num_slots
+    qubits_per_slot = args.num_qubits
+    # memory_depth_per_slot is implicitly 1 for each slot within QuantumMemoryCell, 
+    # as QuantumMemoryCell's memory_depth parameter corresponds to num_mem_slots here.
+    
+    # Quantum Rings credentials (ensure these are set if using qr-cloud)
+    YOUR_QR_TOKEN = "rings-200.awzkwVoeeFuJXmwhgtcXYw8thSABPd3k"
+    YOUR_QR_USER_NAME = "gyanateet@gmail.com"
 
-    hybrid_ctm_model = HybridCTM(input_size=input_dim, 
-                                 hidden_size=hidden_dim, 
-                                 num_memory_slots=mem_slots, 
-                                 num_qubits_per_slot=qubits_per_slot, 
-                                 output_size=output_dim)
+    # Instantiate HybridCTM
+    model_params = {
+        "input_size": input_dim,
+        "hidden_size": hidden_dim,
+        "output_size": output_dim,
+        "num_memory_slots": num_mem_slots,
+        "num_qubits_per_slot": qubits_per_slot,
+        "memory_depth_per_slot": 1, # See note above
+        "backend_mode": args.backend_mode
+    }
+    if args.backend_mode == "qr-cloud":
+        model_params["qr_token"] = YOUR_QR_TOKEN
+        model_params["qr_user_name"] = YOUR_QR_USER_NAME
+        # Can add poll_interval, timeout here if desired to override defaults
 
-    # Dummy input for one time step
-    dummy_x_t = torch.randn(batch_sz, input_dim)
-    # Initial hidden state
-    h_prev_classical = hybrid_ctm_model.init_hidden(batch_sz)
+    try:
+        hybrid_ctm_model = HybridCTM(**model_params)
+        print("HybridCTM model initialized successfully.")
+    except Exception as e:
+        print(f"Error initializing HybridCTM model: {e}")
+        exit()
 
-    print(f"\nRunning one step of Hybrid CTM:")
-    y_t_pred, h_next_classical = hybrid_ctm_model(dummy_x_t, h_prev_classical)
+    # Create dummy input data
+    batch_s = args.batch_size
+    dummy_x_batch = torch.randn(batch_s, input_dim)
+    
+    # For this example, let's assign slots in a round-robin fashion for the batch
+    # Ensure slot indices are within [0, num_mem_slots - 1]
+    dummy_slot_indices = torch.arange(batch_s) % num_mem_slots
 
-    print(f"Output y_t shape: {y_t_pred.shape}") # Expected: (batch_sz, output_dim)
-    print(f"Next hidden state h_next shape: {h_next_classical.shape}") # Expected: (batch_sz, hidden_dim) 
+    print(f"Input batch shape: {dummy_x_batch.shape}")
+    print(f"Target memory slots for batch: {dummy_slot_indices.tolist()}")
+
+    # Perform a forward pass
+    try:
+        print("\nPerforming forward pass...")
+        output, hidden_state = hybrid_ctm_model(dummy_x_batch, dummy_slot_indices)
+        print("Forward pass successful.")
+        print(f"Output shape: {output.shape}")
+        print(f"Hidden state shape: {hidden_state.shape}")
+        print(f"Output example (first item):\n{output[0]}")
+    except Exception as e:
+        print(f"Error during forward pass: {e}")
+
+    print("\nHybridCTM example finished.") 
